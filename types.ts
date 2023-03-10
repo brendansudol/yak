@@ -1,4 +1,4 @@
-export interface IResults {
+export interface ITranscript {
   duration: number
   language: string
   segments: ISegment[]

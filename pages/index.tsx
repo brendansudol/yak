@@ -1,25 +1,35 @@
+import classNames from "classnames"
 import Head from "next/head"
-import React, { FormEvent, useCallback, useRef, useState } from "react"
+import React, { ChangeEvent, FormEvent, useCallback, useRef, useState } from "react"
 import { Transcript } from "@/components/Transcript"
-import { IResults, ISegment } from "@/types"
+import { ISegment, ITranscript } from "@/types"
+
+const AUDIO_MIME_TYPE = "audio/webm"
 
 export default function Home() {
   const audioRef = useRef<HTMLAudioElement>(null)
-  const [results, setResults] = useState<IResults>()
+  const uploadRef = useRef<HTMLInputElement>(null)
+  const mediaRecorder = useRef<MediaRecorder>()
+  const audioChunks = useRef<Blob[]>([])
+
+  const [isRecording, setIsRecording] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [audioUrl, setAudioUrl] = useState<string>()
+  const [transcript, setTranscript] = useState<ITranscript>()
   const [currentSegment, setCurrentSegment] = useState<ISegment>()
 
   const handleTimeUpdate = useCallback(
     (e: FormEvent<HTMLAudioElement>) => {
-      const { currentTime: time } = e.currentTarget
+      const time = e.currentTarget.currentTime
       const curr = currentSegment
-      if (results == null || (curr != null && curr.start <= time && time < curr.end)) return
-      const idx = findSegmentIdx(results.segments, time)
-      setCurrentSegment(results.segments[idx])
+      if (transcript == null || (curr != null && curr.start <= time && time < curr.end)) return
+      const idx = findSegmentIdx(transcript.segments, time)
+      setCurrentSegment(transcript.segments[idx])
     },
-    [currentSegment, results]
+    [currentSegment, transcript]
   )
 
-  const handleTextClick = useCallback((segment: ISegment) => {
+  const handleTranscriptClick = useCallback((segment: ISegment) => {
     const audio = audioRef.current
     if (audio == null) return
     setCurrentSegment(segment)
@@ -27,23 +37,55 @@ export default function Home() {
     if (audio.paused) audio.play()
   }, [])
 
-  const handleUpload = useCallback(async (e: FormEvent<HTMLInputElement>) => {
-    const file = e.currentTarget.files?.[0]
-    if (file == null) return
+  const handleSubmit = useCallback(async (file: Blob, fileName: string) => {
+    try {
+      setIsLoading(true)
+      const formData = new FormData()
+      formData.append("file", file, fileName)
+      const response = await fetch("/api/transcribe", { method: "POST", body: formData })
+      const { results } = await response.json()
+      setTranscript(results)
+      setAudioUrl(URL.createObjectURL(file))
+    } catch (error) {
+      console.error("error getting transcript", error)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
 
-    const formData = new FormData()
-    formData.append("file", file)
+  const handleFileUpload = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      const file = e.currentTarget.files?.[0]
+      if (file == null) return
+      e.target.value = "" // in case user uploads same file again
+      handleSubmit(file, file.name)
+    },
+    [handleSubmit]
+  )
 
-    // TODO: error handling
-    const response = await fetch("/api/transcribe", { method: "POST", body: formData })
-    const { results } = await response.json()
-    console.log(results)
-    setResults(results)
+  const handleStartRecording = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const mr = new MediaRecorder(stream, { mimeType: AUDIO_MIME_TYPE })
+    mediaRecorder.current = mr
+    audioChunks.current = []
 
-    if (audioRef.current == null) return
-    const url = URL.createObjectURL(file)
-    audioRef.current.src = url
-    audioRef.current.play()
+    mr.start(5_000)
+    setIsRecording(true)
+
+    mr.addEventListener("dataavailable", async (evt) => {
+      if (evt.data.size === 0) return
+      audioChunks.current.push(evt.data)
+    })
+
+    mr.addEventListener("stop", () => {
+      setIsRecording(false)
+      const blob = new Blob(audioChunks.current, { type: AUDIO_MIME_TYPE })
+      handleSubmit(blob, "recording.webm")
+    })
+  }, [handleSubmit])
+
+  const handleStopRecording = useCallback(() => {
+    mediaRecorder.current?.stop()
   }, [])
 
   return (
@@ -55,17 +97,72 @@ export default function Home() {
         <link rel="icon" href="/favicon.ico" />
       </Head>
       <main className="mx-auto p-6 sm:px-10 max-w-screen-sm min-h-screen">
-        <input type="file" onChange={handleUpload} accept=".mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm" />
-        <audio className="my-6" ref={audioRef} onTimeUpdate={handleTimeUpdate} controls />
-        {results && (
-          <Transcript
-            segments={results.segments}
-            currentId={currentSegment?.id}
-            onSelect={handleTextClick}
+        <div className="mb-4 grid grid-cols-2 gap-2 text-sm font-bold">
+          <Button className="w-full" onClick={() => uploadRef.current?.click()}>
+            Upload
+          </Button>
+          <Button
+            className="w-full"
+            onClick={isRecording ? handleStopRecording : handleStartRecording}
+          >
+            Record
+          </Button>
+        </div>
+
+        {audioUrl && (
+          <audio
+            ref={audioRef}
+            autoPlay={true}
+            className="my-6 w-full"
+            controls={true}
+            onTimeUpdate={handleTimeUpdate}
+            src={audioUrl}
           />
         )}
+
+        <pre className="my-6 p-2 text-sm border rounded-lg">
+          {JSON.stringify({ isRecording, isLoading }, null, 2)}
+        </pre>
+
+        {transcript && (
+          <Transcript
+            segments={transcript.segments}
+            currentId={currentSegment?.id}
+            onSelect={handleTranscriptClick}
+          />
+        )}
+
+        <input
+          ref={uploadRef}
+          accept=".mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm"
+          className="hidden"
+          onChange={handleFileUpload}
+          type="file"
+        />
       </main>
     </>
+  )
+}
+
+function Button({
+  children,
+  className,
+  onClick,
+}: {
+  children: React.ReactNode
+  className?: string
+  onClick?: () => void
+}) {
+  return (
+    <button
+      className={classNames(
+        "py-3 px-4 flex items-center justify-center text-gray-700 bg-gray-50 border border-gray-200 rounded-xl hover:border-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-300",
+        className
+      )}
+      onClick={onClick}
+    >
+      {children}
+    </button>
   )
 }
 
